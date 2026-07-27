@@ -31,6 +31,11 @@
 //#include <TransistorNoiseSource.h>
 #endif
 
+#ifndef ARDUINO
+#include <cstdlib>
+#include <string>
+#endif
+
 using namespace RNS;
 using namespace RNS::Type::Reticulum;
 using namespace RNS::Utilities;
@@ -131,11 +136,51 @@ Reticulum::Reticulum() : _object(new Object()) {
 	Reticulum.resourcepath  = Reticulum.configdir+"/storage/resources"
 	Reticulum.identitypath  = Reticulum.configdir+"/storage/identities"
 */
-// CBA TEST
-	//_storagepath = ".";
+// DIVERGENCE: configdir resolution + storage/cache paths, ported from the
+// commented-out Python block above (minus config-file parsing, which is
+// separately unimplemented here -- ConfigObj/.ini support doesn't exist
+// yet, so the /etc/reticulum and ~/.config/reticulum branches only check
+// directory presence, not the config file itself). Native/Linux-only:
+// on ARDUINO/embedded targets there's no home directory concept, so this
+// keeps the previous cwd-relative default.
+#ifndef ARDUINO
+	{
+		std::string configdir;
+		if (OS::directory_exists("/etc/reticulum")) {
+			configdir = "/etc/reticulum";
+		}
+		else {
+			const char* home = std::getenv("HOME");
+			std::string userdir = home ? std::string(home) : std::string(".");
+			std::string xdg_configdir = userdir + "/.config/reticulum";
+			if (OS::directory_exists(xdg_configdir.c_str())) {
+				configdir = xdg_configdir;
+			}
+			else {
+				configdir = userdir + "/.reticulum";
+			}
+		}
+
+		std::string storagepath = configdir + "/storage";
+		std::string cachepath = storagepath + "/cache";
+
+		if (!OS::directory_exists(configdir.c_str())) {
+			OS::create_directory(configdir.c_str());
+		}
+		if (!OS::directory_exists(storagepath.c_str())) {
+			OS::create_directory(storagepath.c_str());
+		}
+		if (!OS::directory_exists(cachepath.c_str())) {
+			OS::create_directory(cachepath.c_str());
+		}
+
+		strncpy(_storagepath, storagepath.c_str(), FILEPATH_MAXSIZE);
+		strncpy(_cachepath, cachepath.c_str(), FILEPATH_MAXSIZE);
+	}
+#else
 	strncpy(_storagepath, ".", FILEPATH_MAXSIZE);
-	//_cachepath = "./cache";
 	strncpy(_cachepath, "./cache", FILEPATH_MAXSIZE);
+#endif
 
 /*p TODO
 	if not os.path.isdir(Reticulum.storagepath):
