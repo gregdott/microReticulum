@@ -1579,7 +1579,7 @@ const Bytes Link::sign(const Bytes& message) {
 	return _object->_sig_prv->sign(message);
 }
 
-bool Link::validate(const Bytes& signature, const Bytes& message) {
+bool Link::validate(const Bytes& signature, const Bytes& message) const {
 	assert(_object);
 	try {
 		assert(_object->_peer_sig_pub);

@@ -5902,6 +5902,17 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 		DEBUGF("Neighbor probe: skipping %s — identity not yet known (announce not received?)",
 		       neighbor_hash.toHex().c_str());
 
+		// Bug: this early-return path used to leave last_probe_at
+		// untouched, so _scan_neighbor_stats()'s per-neighbor rate limit
+		// (NEIGHBOR_PROBE_RATELIMIT) never actually engaged for a neighbor
+		// whose identity isn't known yet -- every scan tick (multiple
+		// times per second) re-classified it as "suspicious" and retried
+		// this same dead-end dispatch, producing a tight log-spam loop
+		// instead of a genuine rate-limited retry. Stamping last_probe_at
+		// here makes this outcome subject to the same backoff as every
+		// other skip/dispatch path.
+		_neighbor_stats[neighbor_hash].last_probe_at = OS::time();
+
 		// CBA How to discern a missing neighbor from a neighbor that does not have probing enabled???
 		// For now we invalidate the neighbor anyway just to err on the side of healing
 		//_invalidate_neighbor(neighbor_hash);
