@@ -283,6 +283,18 @@ namespace RNS { namespace Type {
 
 		const uint8_t PR_TAG_WINDOW = 30;
 
+		/*
+		The default number of generated ratchet keys a destination will retain, if it
+		has ratchets enabled. Matches the Python reference implementation's default for
+		desktop/server-class builds. Constrained (MCU) builds should generally override
+		this to a much smaller value via set_retained_ratchets() — see RNS_RATCHET_COUNT_DEFAULT
+		in Destination.cpp.
+		*/
+		static const uint16_t RATCHET_COUNT = 512;
+
+		// The minimum interval between rotating ratchet keys, in seconds.
+		static const uint32_t RATCHET_INTERVAL = 60*30;
+
 	}
 
 	namespace Link {

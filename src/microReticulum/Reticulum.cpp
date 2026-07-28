@@ -15,6 +15,7 @@
 #include "Reticulum.h"
 
 #include "Transport.h"
+#include "Identity.h"
 #include "Log.h"
 #include "Type.h"
 #include "Utilities/Memory.h"
@@ -256,6 +257,10 @@ void Reticulum::start() {
 	INFO("Starting Provisioning...");
 	Provisioning::Provisioner::instance().begin();
 #endif
+
+	// Discard any remembered remote ratchets that expired while we were offline,
+	// matching upstream's one-shot cleanup at startup (not a recurring job).
+	Identity::clean_ratchets();
 
 	INFO("Starting Transport...");
 	Transport::start(*this);

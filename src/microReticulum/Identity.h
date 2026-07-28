@@ -23,10 +23,12 @@
 #include "Cryptography/Token.h"
 #include "Utilities/Memory.h"
 #include "Persistence/IdentityEntry.h"
+#include "Persistence/RatchetEntry.h"
 
 #include <map>
 #include <string>
 #include <memory>
+#include <vector>
 #include <cassert>
 
 namespace RNS {
@@ -38,6 +40,7 @@ namespace RNS {
 
 	public:
 		using IdentityEntry = Persistence::IdentityEntry;
+		using RatchetEntry = Persistence::RatchetEntry;
 
 	private:
 		static Persistence::KnownStore _known_store;
@@ -46,6 +49,11 @@ namespace RNS {
 		static uint16_t _known_destinations_maxsize;
 		static uint32_t _known_store_segment_size;
 		static uint8_t _known_store_segment_count;
+
+		// Identity-side remote ratchet cache: the most recently announced ratchet
+		// public key for each remote destination hash that has announced one.
+		static Persistence::RatchetStore _ratchet_store;
+		static Persistence::KnownRatchets _known_ratchets;
 
 	public:
 		Identity(bool create_keys = true);
@@ -102,8 +110,8 @@ namespace RNS {
 		inline const Bytes& get_salt() const { assert(_object); return _object->_hash; }
 		inline const Bytes get_context() const { return {Bytes::NONE}; }
 
-		const Bytes encrypt(const Bytes& plaintext) const;
-		const Bytes decrypt(const Bytes& ciphertext_token) const;
+		const Bytes encrypt(const Bytes& plaintext, const Bytes& ratchet = {Bytes::NONE}) const;
+		const Bytes decrypt(const Bytes& ciphertext_token, const std::vector<Bytes>& ratchets = {}, bool enforce_ratchets = false, Bytes* used_ratchet_id = nullptr) const;
 		const Bytes sign(const Bytes& message) const;
 		bool validate(const Bytes& signature, const Bytes& message) const;
 		// CBA following default for reference value requires inclusiion of header
@@ -148,6 +156,17 @@ namespace RNS {
 		}
 
 		static bool validate_announce(const Packet& packet, bool only_validate_signature = false);
+
+		// Ratchet support (Identity-side remote ratchet cache — see Persistence/RatchetEntry.h)
+		static Bytes _generate_ratchet();
+		static Bytes _ratchet_public_bytes(const Bytes& ratchet);
+		static Bytes _get_ratchet_id(const Bytes& ratchet_pub_bytes);
+		static void _remember_ratchet(const Bytes& destination_hash, const Bytes& ratchet);
+		static Bytes get_ratchet(const Bytes& destination_hash);
+		static Bytes current_ratchet_id(const Bytes& destination_hash);
+		// Periodic maintenance: discards remembered remote ratchets older than
+		// Type::Identity::RATCHET_EXPIRY. Intended to be called from Transport::jobs().
+		static void clean_ratchets();
 
 		// getters/setters
 		inline const Bytes& encryptionPrivateKey() const { assert(_object); return _object->_prv_bytes; }

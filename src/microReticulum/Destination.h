@@ -20,6 +20,7 @@
 #include "Identity.h"
 #include "Bytes.h"
 #include "Type.h"
+#include "Persistence/DestinationRatchetsEntry.h"
 
 #include <memory>
 #include <string>
@@ -213,6 +214,40 @@ namespace RNS {
 		virtual const Bytes decrypt(const Bytes& data);
 		virtual const Bytes sign(const Bytes& message);
 
+		/*
+		Enables ratchets on the destination. When ratchets are enabled, this destination
+		will automatically rotate the keys used to encrypt packets sent to it, and
+		include the latest ratchet key in announces, giving forward secrecy for packets
+		sent to it: a compromised long-term identity key no longer allows decrypting
+		previously captured traffic once a ratchet has rotated past the key that was
+		used at the time. Link-based communication already gets forward secrecy via its
+		own per-link ephemeral key exchange, so ratchets mainly matter for destinations
+		that receive data outside of a Link (e.g. single/plain packets).
+
+		Ratchet history is retained (see set_retained_ratchets()) so packets encrypted
+		against an already-rotated-past ratchet can still be decrypted.
+		*/
+		void enable_ratchets();
+		// Force an immediate rotation check (normally called automatically on announce/receive).
+		void rotate_ratchets();
+		/*
+		When ratchet enforcement is enabled, this destination will never accept packets
+		that were not encrypted using one of its ratchet keys.
+		*/
+		inline void enforce_ratchets() { assert(_object); _object->_enforce_ratchets = true; }
+		// Sets the number of previously generated ratchet keys this destination will
+		// retain, and try to use when decrypting incoming packets.
+		void set_retained_ratchets(uint16_t retained_ratchets);
+		// Sets the minimum interval in seconds between ratchet key rotation.
+		inline void set_ratchet_interval(uint32_t interval) { assert(_object); _object->_ratchet_interval = interval; }
+		inline bool ratchets_enabled() const { assert(_object); return _object->_ratchets_enabled; }
+
+	private:
+		void _clean_ratchets();
+		void _persist_ratchets();
+
+	public:
+
 		// CBA
 		bool has_link(const Link& link);
 		void remove_link(const Link& link);
@@ -245,6 +280,13 @@ namespace RNS {
 		//inline void increment_txbytes(uint16_t bytes) { assert(_object); _object->_txbytes += bytes; }
 
 	private:
+		// Owned-destination ratchet history (see enable_ratchets()). Kept separate from
+		// Identity's known_ratchets (which caches the single latest ratchet *seen
+		// announced* for remote destinations) — this is this destination's own rotating
+		// list of private keys, keyed by its own hash.
+		static Persistence::DestinationRatchetsStore _ratchets_store;
+		static Persistence::DestinationRatchets _destination_ratchets;
+
 		class Object {
 		public:
 			Object(const Identity& identity) : _identity(identity) { MEMF("Destination::Data object created, this: %p", (void*)this); }
@@ -273,6 +315,17 @@ namespace RNS {
 			Bytes _default_app_data;
 			//z _callback = None
 			//z _proofcallback = None
+
+			// Ratchets (see Destination::enable_ratchets()). Own private ratchet keys,
+			// newest first. Kept in RAM as the working copy; persisted to
+			// Destination::_destination_ratchets (keyed by _hash) on rotation.
+			bool _ratchets_enabled = false;
+			std::vector<Bytes> _ratchets;
+			uint32_t _ratchet_interval = Type::Destination::RATCHET_INTERVAL;
+			uint16_t _retained_ratchets = Type::Destination::RATCHET_COUNT;
+			double _latest_ratchet_time = 0;
+			Bytes _latest_ratchet_id;
+			bool _enforce_ratchets = false;
 
 			// CBA LINK
 			// CBA _link_id is expected by Packet but only present in Link

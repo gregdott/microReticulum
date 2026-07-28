@@ -27,6 +27,9 @@ using namespace RNS;
 using namespace RNS::Type::Destination;
 using namespace RNS::Utilities;
 
+/*static*/ Persistence::DestinationRatchetsStore Destination::_ratchets_store;
+/*static*/ Persistence::DestinationRatchets Destination::_destination_ratchets(Destination::_ratchets_store);
+
 Destination::Destination(const Identity& identity, const directions direction, const types type, const char* app_name, const char* aspects) : _object(new Object(identity)) {
 	assert(_object);
 	MEMF("Destination object creating..., this: %p, data: %p", (void*)this, (void*)_object.get());
@@ -284,6 +287,13 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 				new_app_data = _object->_default_app_data;
 			}
 
+			Bytes ratchet;
+			if (_object->_ratchets_enabled) {
+				rotate_ratchets();
+				ratchet = Identity::_ratchet_public_bytes(_object->_ratchets.front());
+				Identity::_remember_ratchet(_object->_hash, ratchet);
+			}
+
 			Bytes signed_data;
 			//TRACEF("Destination::announce: hash:         %s", _object->_hash.toHex().c_str());
 			//TRACEF("Destination::announce: public key:   %s", _object->_identity.get_public_key().toHex().c_str());
@@ -291,7 +301,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			//TRACEF("Destination::announce: random hash:  %s", random_hash.toHex().c_str());
 			//TRACEF("Destination::announce: app data:     %s", new_app_data.toHex().c_str());
 			//TRACEF("Destination::announce: app data text:%s", new_app_data.toString().c_str());
-			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash;
+			signed_data << _object->_hash << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet;
 			if (new_app_data) {
 				signed_data << new_app_data;
 			}
@@ -300,7 +310,7 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 			Bytes signature(_object->_identity.sign(signed_data));
 			//TRACEF("Destination::announce: signature:    %s", signature.toHex().c_str());
 
-			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash << signature;
+			announce_data << _object->_identity.get_public_key() << _object->_name_hash << random_hash << ratchet << signature;
 
 			if (new_app_data) {
 				announce_data << new_app_data;
@@ -330,7 +340,8 @@ Packet Destination::announce(const Bytes& app_data, bool path_response, const In
 		Packet announce_packet = Packet(*this, announce_data)
 			.attached_interface(attached_interface)
 			.packet_type(Type::Packet::ANNOUNCE)
-			.context(announce_context);
+			.context(announce_context)
+			.context_flag(_object->_ratchets_enabled ? Type::Packet::FLAG_SET : Type::Packet::FLAG_UNSET);
 		// transport_type=BROADCAST and header_type=HEADER_1 are the defaults.
 
 		if (send) {
@@ -459,7 +470,10 @@ Encrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 	}
 
 	if (_object->_type == SINGLE && _object->_identity) {
-		return _object->_identity.encrypt(data);
+		// If this identity has announced a ratchet, prefer encrypting against it
+		// instead of its static public key, so traffic to it gets forward secrecy.
+		Bytes ratchet = Identity::get_ratchet(_object->_hash);
+		return _object->_identity.encrypt(data, ratchet);
 	}
 
 // TODO
@@ -496,6 +510,12 @@ Decrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 	}
 
 	if (_object->_type == SINGLE && _object->_identity) {
+		if (_object->_ratchets_enabled) {
+			Bytes used_ratchet_id;
+			Bytes plaintext = _object->_identity.decrypt(data, _object->_ratchets, _object->_enforce_ratchets, &used_ratchet_id);
+			_object->_latest_ratchet_id = used_ratchet_id;
+			return plaintext;
+		}
 		return _object->_identity.decrypt(data);
 	}
 
@@ -513,6 +533,65 @@ Decrypts information for ``RNS.Destination.SINGLE`` or ``RNS.Destination.GROUP``
 */
 	// MOCK
 	return {Bytes::NONE};
+}
+
+void Destination::enable_ratchets() {
+	assert(_object);
+	if (_object->_direction != IN) {
+		throw std::invalid_argument("Cannot enable ratchets on an OUT destination");
+	}
+	_object->_ratchets_enabled = true;
+	_object->_latest_ratchet_time = 0;
+
+	Persistence::DestinationRatchetsEntry entry;
+	if (_destination_ratchets.get(_object->_hash, entry) && entry) {
+		_object->_ratchets = entry._ratchets;
+		_object->_latest_ratchet_time = entry._latest_ratchet_time;
+	}
+	else {
+		_object->_ratchets.clear();
+	}
+
+	TRACEF("Ratchets enabled on %s", toString().c_str());
+}
+
+void Destination::_clean_ratchets() {
+	assert(_object);
+	if (_object->_ratchets.size() > _object->_retained_ratchets) {
+		_object->_ratchets.resize(_object->_retained_ratchets);
+	}
+}
+
+void Destination::_persist_ratchets() {
+	assert(_object);
+	Persistence::DestinationRatchetsEntry entry(_object->_ratchets, _object->_latest_ratchet_time);
+	if (!_destination_ratchets.put(_object->_hash, entry)) {
+		ERRORF("_persist_ratchets: failed to store ratchets for %s", toString().c_str());
+	}
+}
+
+void Destination::rotate_ratchets() {
+	assert(_object);
+	if (!_object->_ratchets_enabled) {
+		throw std::runtime_error("Cannot rotate ratchets on " + toString() + ", ratchets are not enabled");
+	}
+	double now = OS::time();
+	if (now > _object->_latest_ratchet_time + _object->_ratchet_interval) {
+		TRACEF("Rotating ratchets for %s", toString().c_str());
+		Bytes new_ratchet = Identity::_generate_ratchet();
+		_object->_ratchets.insert(_object->_ratchets.begin(), new_ratchet);
+		_object->_latest_ratchet_time = now;
+		_clean_ratchets();
+		_persist_ratchets();
+	}
+}
+
+void Destination::set_retained_ratchets(uint16_t retained_ratchets) {
+	assert(_object);
+	if (retained_ratchets > 0) {
+		_object->_retained_ratchets = retained_ratchets;
+		_clean_ratchets();
+	}
 }
 
 /*

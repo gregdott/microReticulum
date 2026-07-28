@@ -60,6 +60,9 @@ using namespace RNS::Utilities;
 #endif
 /*static*/ Persistence::KnownDestinations Identity::_known_destinations(Identity::_known_store);
 
+/*static*/ Persistence::RatchetStore Identity::_ratchet_store;
+/*static*/ Persistence::KnownRatchets Identity::_known_ratchets(Identity::_ratchet_store);
+
 Identity::Identity(bool create_keys /*= true*/) : _object(new Object()) {
 	if (create_keys) {
 		createKeys();
@@ -402,6 +405,10 @@ Recall last heard app_data for a destination hash.
 						remember(packet.get_hash(), destination_hash, public_key, app_data);
 					}
 
+					if (ratchet) {
+						_remember_ratchet(destination_hash, ratchet);
+					}
+
 					std::string signal_str;
 					if (!Type::isNan(packet.rssi()) or !Type::isNan(packet.snr())) {
 						signal_str = " [";
@@ -452,7 +459,7 @@ Encrypts information for the identity.
 :returns: Ciphertext token as *bytes*.
 :raises: *KeyError* if the instance does not hold a public key.
 */
-const Bytes Identity::encrypt(const Bytes& plaintext) const {
+const Bytes Identity::encrypt(const Bytes& plaintext, const Bytes& ratchet /*= {Bytes::NONE}*/) const {
 	assert(_object);
 	TRACE("Identity::encrypt: encrypting data...");
 	if (!_object->_pub) {
@@ -462,9 +469,12 @@ const Bytes Identity::encrypt(const Bytes& plaintext) const {
 	Bytes ephemeral_pub_bytes = ephemeral_key->public_key()->public_bytes();
 	TRACEF("Identity::encrypt: ephemeral public key: %s", ephemeral_pub_bytes.toHex().c_str());
 
-	// CRYPTO: create shared key for key exchange using own public key
-	//shared_key = ephemeral_key.exchange(self.pub)
-	Bytes shared_key = ephemeral_key->exchange(_object->_pub_bytes);
+	// CRYPTO: create shared key for key exchange, using the supplied ratchet public
+	// key instead of the identity's own long-term public key if one was provided
+	// (gives forward secrecy — see Identity::_remember_ratchet / Destination::rotate_ratchets)
+	//shared_key = ephemeral_key.exchange(ratchet if ratchet else self.pub)
+	const Bytes& target_public_key = ratchet ? ratchet : _object->_pub_bytes;
+	Bytes shared_key = ephemeral_key->exchange(target_public_key);
 	TRACEF("Identity::encrypt: shared key:           %s", shared_key.toHex().c_str());
 
 	Bytes derived_key = Cryptography::hkdf(
@@ -492,7 +502,7 @@ Decrypts information for the identity.
 :returns: Plaintext as *bytes*, or *None* if decryption fails.
 :raises: *KeyError* if the instance does not hold a private key.
 */
-const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
+const Bytes Identity::decrypt(const Bytes& ciphertext_token, const std::vector<Bytes>& ratchets /*= {}*/, bool enforce_ratchets /*= false*/, Bytes* used_ratchet_id /*= nullptr*/) const {
 	assert(_object);
 	TRACE("Identity::decrypt: decrypting data...");
 	if (!_object->_prv) {
@@ -502,42 +512,131 @@ const Bytes Identity::decrypt(const Bytes& ciphertext_token) const {
 		DEBUGF("Decryption failed because the token size %lu was invalid.", ciphertext_token.size());
 		return {Bytes::NONE};
 	}
+
+	if (used_ratchet_id) *used_ratchet_id = {Bytes::NONE};
+
+	//peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
+	Bytes peer_pub_bytes = ciphertext_token.left(Type::Identity::KEYSIZE/8/2);
+	//ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
+	Bytes ciphertext(ciphertext_token.mid(Type::Identity::KEYSIZE/8/2));
+
 	Bytes plaintext;
-	try {
-		//peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
-		Bytes peer_pub_bytes = ciphertext_token.left(Type::Identity::KEYSIZE/8/2);
-		//peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
-		//Cryptography::X25519PublicKey::Ptr peer_pub = Cryptography::X25519PublicKey::from_public_bytes(peer_pub_bytes);
-		TRACEF("Identity::decrypt: peer public key:      %s", peer_pub_bytes.toHex().c_str());
 
-
-		// CRYPTO: create shared key for key exchange using peer public key
-		//shared_key = _object->_prv->exchange(peer_pub);
-		Bytes shared_key = _object->_prv->exchange(peer_pub_bytes);
-		TRACEF("Identity::decrypt: shared key:           %s", shared_key.toHex().c_str());
-
-		Bytes derived_key = Cryptography::hkdf(
-			DERIVED_KEY_LENGTH,
-			shared_key,
-			get_salt(),
-			get_context()
-		);
-		TRACEF("Identity::decrypt: derived key:          %s", derived_key.toHex().c_str());
-
-		Cryptography::Token token(derived_key);
-		//ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
-		Bytes ciphertext(ciphertext_token.mid(Type::Identity::KEYSIZE/8/2));
-		TRACEF("Identity::decrypt: Token decrypting data of length %lu", ciphertext.size());
-		TRACEF("Identity::decrypt: ciphertext: %s", ciphertext.toHex().c_str());
-		plaintext = token.decrypt(ciphertext);
-		TRACEF("Identity::decrypt: plaintext:  %s", plaintext.toHex().c_str());
-		//TRACEF("Identity::decrypt: Token decrypted data of length %lu", plaintext.size());
+	// Try each retained ratchet private key in turn before falling back to the
+	// static private key, matching upstream's per-candidate try/except loop. A
+	// packet encrypted against an already-rotated-past ratchet can still be
+	// decrypted as long as that ratchet is still in the retained history.
+	for (const Bytes& ratchet : ratchets) {
+		try {
+			Cryptography::X25519PrivateKey::Ptr ratchet_prv = Cryptography::X25519PrivateKey::from_private_bytes(ratchet);
+			Bytes shared_key = ratchet_prv->exchange(peer_pub_bytes);
+			Bytes derived_key = Cryptography::hkdf(DERIVED_KEY_LENGTH, shared_key, get_salt(), get_context());
+			Cryptography::Token token(derived_key);
+			plaintext = token.decrypt(ciphertext);
+			if (used_ratchet_id) *used_ratchet_id = _get_ratchet_id(ratchet_prv->public_key()->public_bytes());
+			break;
+		}
+		catch (const std::exception& e) {
+			// try the next ratchet
+		}
 	}
-	catch (const std::exception& e) {
-		DEBUGF("Decryption by %s failed: %s", toString().c_str(), e.what());
+
+	if (enforce_ratchets && !plaintext) {
+		DEBUGF("Decryption with ratchet enforcement by %s failed. Dropping packet.", toString().c_str());
+		if (used_ratchet_id) *used_ratchet_id = {Bytes::NONE};
+		return {Bytes::NONE};
 	}
-		
+
+	if (!plaintext) {
+		try {
+			TRACEF("Identity::decrypt: peer public key:      %s", peer_pub_bytes.toHex().c_str());
+
+			// CRYPTO: create shared key for key exchange using peer public key
+			//shared_key = _object->_prv->exchange(peer_pub);
+			Bytes shared_key = _object->_prv->exchange(peer_pub_bytes);
+			TRACEF("Identity::decrypt: shared key:           %s", shared_key.toHex().c_str());
+
+			Bytes derived_key = Cryptography::hkdf(
+				DERIVED_KEY_LENGTH,
+				shared_key,
+				get_salt(),
+				get_context()
+			);
+			TRACEF("Identity::decrypt: derived key:          %s", derived_key.toHex().c_str());
+
+			Cryptography::Token token(derived_key);
+			TRACEF("Identity::decrypt: Token decrypting data of length %lu", ciphertext.size());
+			TRACEF("Identity::decrypt: ciphertext: %s", ciphertext.toHex().c_str());
+			plaintext = token.decrypt(ciphertext);
+			TRACEF("Identity::decrypt: plaintext:  %s", plaintext.toHex().c_str());
+			//TRACEF("Identity::decrypt: Token decrypted data of length %lu", plaintext.size());
+
+			if (used_ratchet_id) *used_ratchet_id = {Bytes::NONE};
+		}
+		catch (const std::exception& e) {
+			DEBUGF("Decryption by %s failed: %s", toString().c_str(), e.what());
+		}
+	}
+
 	return plaintext;
+}
+
+/*static*/ Bytes Identity::_generate_ratchet() {
+	Cryptography::X25519PrivateKey::Ptr ratchet_prv = Cryptography::X25519PrivateKey::generate();
+	return ratchet_prv->private_bytes();
+}
+
+/*static*/ Bytes Identity::_ratchet_public_bytes(const Bytes& ratchet) {
+	return Cryptography::X25519PrivateKey::from_private_bytes(ratchet)->public_key()->public_bytes();
+}
+
+/*static*/ Bytes Identity::_get_ratchet_id(const Bytes& ratchet_pub_bytes) {
+	return full_hash(ratchet_pub_bytes).left(Type::Identity::NAME_HASH_LENGTH/8);
+}
+
+/*static*/ void Identity::_remember_ratchet(const Bytes& destination_hash, const Bytes& ratchet) {
+	RatchetEntry existing;
+	if (_known_ratchets.get(destination_hash, existing) && existing && existing._ratchet == ratchet) {
+		// Already remembered, nothing to do (avoids unnecessary flash wear).
+		return;
+	}
+	TRACEF("Remembering ratchet %s for %s", _get_ratchet_id(ratchet).toHex().c_str(), destination_hash.toHex().c_str());
+	RatchetEntry entry(OS::time(), ratchet);
+	if (!_known_ratchets.put(destination_hash, entry)) {
+		ERRORF("_remember_ratchet: failed to store ratchet for %s", destination_hash.toHex().c_str());
+	}
+}
+
+/*static*/ Bytes Identity::get_ratchet(const Bytes& destination_hash) {
+	RatchetEntry entry;
+	if (_known_ratchets.get(destination_hash, entry) && entry) {
+		if (OS::time() < entry._received + Type::Identity::RATCHET_EXPIRY && entry._ratchet.size() == Type::Identity::RATCHETSIZE/8) {
+			return entry._ratchet;
+		}
+	}
+	TRACEF("Identity::get_ratchet: Could not load ratchet for %s", destination_hash.toHex().c_str());
+	return {Bytes::NONE};
+}
+
+/*static*/ Bytes Identity::current_ratchet_id(const Bytes& destination_hash) {
+	Bytes ratchet = get_ratchet(destination_hash);
+	if (!ratchet) return {Bytes::NONE};
+	return _get_ratchet_id(ratchet);
+}
+
+/*static*/ void Identity::clean_ratchets() {
+	TRACE("Cleaning ratchets...");
+	double now = OS::time();
+	std::vector<Bytes> expired;
+	for (auto& entry : _known_ratchets) {
+		if (now > entry.value._received + Type::Identity::RATCHET_EXPIRY) {
+			expired.push_back(entry.key);
+		}
+	}
+	for (const Bytes& destination_hash : expired) {
+		_known_ratchets.remove(destination_hash);
+	}
+	TRACEF("Cleaned %lu expired ratchets", expired.size());
 }
 
 /*
