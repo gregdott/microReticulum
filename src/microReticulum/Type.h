@@ -543,6 +543,12 @@ namespace RNS { namespace Type {
 		static const uint16_t  NEIGHBOR_PROBE_RATELIMIT    = 300;   // min seconds between probes per neighbor
 		static const uint8_t  NEIGHBOR_PROBE_TIMEOUT      = 15;   // seconds before a probe is considered failed
 		static const uint8_t  NEIGHBOR_PROBE_PAYLOAD_SIZE = 16;   // bytes of random payload in a probe
+		// A single dropped probe (or dropped proof) is common over a lossy
+		// LoRa/RNode leg and is not, by itself, good evidence a neighbor is
+		// actually down. Require this many *consecutive* timed-out probes
+		// before demoting any of its paths to UNRESPONSIVE; a single
+		// success anywhere in the sequence resets the counter.
+		static const uint8_t  NEIGHBOR_PROBE_MAX_ATTEMPTS = 3;
 #endif
 
 		static const uint8_t MAX_QUEUED_DISCOVERY_PRS = RNS_QUEUED_DISCOVERY_PRS_MAX;   // Max amount of queued discovery path requests

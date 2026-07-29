@@ -243,6 +243,7 @@ namespace RNS {
 			double   last_probe_at       = 0;
 			bool     probe_pending       = false;
 			Bytes    pending_probe_hash;   // truncated hash of in-flight probe packet
+			uint8_t  consecutive_probe_failures = 0;   // reset on any successful probe
 		};
 		using NeighborStatsTable = std::map<
 			Bytes, NeighborStat,

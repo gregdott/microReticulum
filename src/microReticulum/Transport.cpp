@@ -501,6 +501,15 @@ DestinationEntry empty_destination_entry;
 			// Process active and pending link lists
 			if (OS::time() > (_links_last_checked + _links_check_interval)) {
 				std::set<Link> pending_links(_pending_links);
+				// Pump each pending link's establishment/handshake watchdog.
+				// Without this, a link whose request/proof never arrives
+				// stays in _pending_links forever instead of timing out.
+				for (auto& link_const : pending_links) {
+					Link& link = const_cast<Link&>(link_const);
+					if (link.status() != Type::Link::CLOSED) {
+						link.tick_watchdog();
+					}
+				}
 				for (auto& link : pending_links) {
 					if (link.status() == Type::Link::CLOSED) {
 						// If we are not a Transport Instance, finding a pending link
@@ -547,6 +556,12 @@ DestinationEntry empty_destination_entry;
 				// shared_ptr-backed mutation is the codebase convention.
 				for (auto& link_const : active_links) {
 					Link& link = const_cast<Link&>(link_const);
+					if (link.status() != Type::Link::CLOSED) {
+						// Pump keepalive/stale-timeout watchdog first so a link
+						// that just went STALE/CLOSED is skipped by the resource
+						// pump below rather than ticking resources on a dead link.
+						link.tick_watchdog();
+					}
 					if (link.status() != Type::Link::CLOSED) {
 						link.tick_resources();
 					}
@@ -6049,23 +6064,40 @@ TRACEF("Transport::write_path_table: buffer size %lu bytes", Persistence::_buffe
 		it->second.pending_probe_hash = Bytes();
 		it->second.packets_forwarded = 0;
 		it->second.proofs_received = 0;
+		it->second.consecutive_probe_failures = 0;
 	}
 	_validate_neighbor(neighbor_hash);
 }
 
-// DIVERGENCE: probe-timed-out outcome — neighbor's receive side is
-// likely down. Demote every path going through this neighbor; existing
-// announce-replacement logic will swap them back in when (and if) a
-// fresh announce arrives over a working route.
+// DIVERGENCE: probe-timed-out outcome. A single dropped probe/proof is
+// unremarkable on a lossy link, so this retries immediately for up to
+// NEIGHBOR_PROBE_MAX_ATTEMPTS consecutive failures before concluding the
+// neighbor's receive side is actually down and demoting every path
+// through it; existing announce-replacement logic will swap them back
+// in when (and if) a fresh announce arrives over a working route.
 /*static*/ void Transport::_neighbor_probe_timed_out(const PacketReceipt& /*receipt*/, const Bytes& neighbor_hash) {
 	TRACEF("Neighbor probe to %s timed-out", neighbor_hash.toHex().c_str());
-	auto it = _neighbor_stats.find(neighbor_hash);
-	if (it != _neighbor_stats.end()) {
-		it->second.probe_pending = false;
-		it->second.pending_probe_hash = Bytes();
-	}
-	_invalidate_neighbor(neighbor_hash);
 	++_probes_failed;
+
+	auto it = _neighbor_stats.find(neighbor_hash);
+	if (it == _neighbor_stats.end()) return;
+
+	it->second.probe_pending = false;
+	it->second.pending_probe_hash = Bytes();
+	++it->second.consecutive_probe_failures;
+
+	if (it->second.consecutive_probe_failures < Type::Transport::NEIGHBOR_PROBE_MAX_ATTEMPTS) {
+		INFOF("Neighbor probe: %s timed out (attempt %u/%u) — retrying before demoting its paths",
+		      neighbor_hash.toHex().c_str(),
+		      (unsigned)it->second.consecutive_probe_failures,
+		      (unsigned)Type::Transport::NEIGHBOR_PROBE_MAX_ATTEMPTS);
+		_dispatch_neighbor_probe(neighbor_hash);
+		return;
+	}
+
+	NOTICEF("Neighbor probe: %s failed %u consecutive probes — demoting its paths",
+	        neighbor_hash.toHex().c_str(), (unsigned)it->second.consecutive_probe_failures);
+	_invalidate_neighbor(neighbor_hash);
 }
 #endif
 

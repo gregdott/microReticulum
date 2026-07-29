@@ -211,8 +211,11 @@ namespace RNS {
 		void teardown();
 		void teardown_packet(const Packet& packet);
 		void link_closed();
-		void start_watchdog();
-		void __watchdog_job();
+		// Cooperative, non-blocking replacement for the reference implementation's
+		// dedicated __watchdog_job() thread: instead of sleeping until the next
+		// deadline, this checks whether a deadline has already passed and acts if
+		// so. Safe to call from Transport::jobs() for every pending/active link.
+		void tick_watchdog();
 		// Cooperative pump: iterate this link's incoming/outgoing resources
 		// and tick each Resource::__watchdog_job(). Safe to call from
 		// Transport::jobs() — snapshots both sets before pumping so that a

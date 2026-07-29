@@ -220,7 +220,6 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 		set_link_id(_object->_packet);
 		Transport::register_link(*this);
 		_object->_request_time = OS::time();
-		start_watchdog();
 		_object->_packet.send();
 		had_outbound();
 		DEBUGF("Link request %s sent to %s", _object->_link_id.toHex().c_str(), _object->_destination.toString().c_str());
@@ -330,8 +329,7 @@ Link::Link(const Destination& destination /*= {Type::NONE}*/, Callbacks::establi
 			link.request_time(OS::time());
 			Transport::register_link(link);
 			link.last_inbound(OS::time());
-			link.start_watchdog();
-			
+
 			DEBUGF("Incoming link request %s accepted", link.toString().c_str());
 			return link;
 		}
@@ -880,86 +878,62 @@ void Link::tick_resources() {
 	for (auto& r : outgoing) r.__watchdog_job();
 }
 
-// CBA TODO Implement watchdog
-void Link::start_watchdog() {
-	//z thread = threading.Thread(target=_object->___watchdog_job)
-	//z thread.daemon = True
-	//z thread.start()
-}
-
-/*p TODO
-
-void Link::__watchdog_job() {
+// Cooperative, non-blocking port of the reference implementation's
+// __watchdog_job(): that version runs on a dedicated thread which sleeps
+// until the next deadline; this version is called once per Transport::jobs()
+// cycle for every pending/active link and simply checks whether a deadline
+// has already passed. No sleep/backoff bookkeeping is needed since the
+// caller (Transport::jobs()) already self-throttles via _job_interval.
+void Link::tick_watchdog() {
 	assert(_object);
-	while not _object->_status == Type::Link::CLOSED:
-		while (_object->_watchdog_lock):
-			rtt_wait = 0.025
-			if hasattr(self, "rtt") and _object->_rtt:
-				rtt_wait = _object->_rtt
+	if (_object->_status == Type::Link::CLOSED) return;
+	// Mirrors the reference implementation's guard against running the
+	// watchdog check while a receive() is actively mutating link state.
+	if (_object->_watchdog_lock) return;
 
-			sleep(max(rtt_wait, 0.025))
+	if (_object->_status == Type::Link::PENDING) {
+		// Link was initiated, but no response from destination yet
+		if (OS::time() >= _object->_request_time + _object->_establishment_timeout) {
+			VERBOSE("Link establishment timed out");
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
+	}
+	else if (_object->_status == Type::Link::HANDSHAKE) {
+		if (OS::time() >= _object->_request_time + _object->_establishment_timeout) {
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
 
-		if not _object->_status == Type::Link::CLOSED:
-			# Link was initiated, but no response
-			# from destination yet
-			if _object->_status == PENDING:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					RNS.log("Link establishment timed out", RNS.LOG_VERBOSE)
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
+			if (_object->_initiator) {
+				DEBUG("Timeout waiting for link request proof");
+			}
+			else {
+				DEBUG("Timeout waiting for RTT packet from link initiator");
+			}
+		}
+	}
+	else if (_object->_status == Type::Link::ACTIVE) {
+		double activated_at = _object->_activated_at;
+		double last_inbound = std::max({_object->_last_inbound, _object->_last_proof, activated_at});
 
-			elif _object->_status == Type::Link::HANDSHAKE:
-				next_check = _object->_request_time + _object->_establishment_timeout
-				sleep_time = next_check - OS::time()
-				if OS::time() >= _object->_request_time + _object->_establishment_timeout:
-					_object->_status = Type::Link::CLOSED
-					_object->_teardown_reason = TIMEOUT
-					link_closed()
-					sleep_time = 0.001
+		if (OS::time() >= last_inbound + _object->_keepalive) {
+			if (_object->_initiator) {
+				send_keepalive();
+			}
 
-					if _object->_initiator:
-						RNS.log("Timeout waiting for link request proof", RNS.LOG_DEBUG)
-					else:
-						RNS.log("Timeout waiting for RTT packet from link initiator", RNS.LOG_DEBUG)
-
-			elif _object->_status == Type::Link::ACTIVE:
-				activated_at = _object->_activated_at if _object->_activated_at != None else 0
-				last_inbound = max(max(_object->_last_inbound, _object->_last_proof), activated_at)
-
-				if OS::time() >= last_inbound + _object->_keepalive:
-					if _object->_initiator:
-						send_keepalive()
-
-					if OS::time() >= last_inbound + _object->_stale_time:
-						sleep_time = _object->_rtt * _object->_keepalive_timeout_factor + STALE_GRACE
-						_object->_status = STALE
-					else:
-						sleep_time = _object->_keepalive
-				
-				else:
-					sleep_time = (last_inbound + _object->_keepalive) - OS::time()
-
-			elif _object->_status == STALE:
-				sleep_time = 0.001
-				_object->_status = Type::Link::CLOSED
-				_object->_teardown_reason = TIMEOUT
-				link_closed()
-
-
-			if sleep_time == 0:
-				RNS.log("Warning! Link watchdog sleep time of 0!", RNS.LOG_ERROR)
-			if sleep_time == None or sleep_time < 0:
-				RNS.log("Timing error! Tearing down link "+str(self)+" now.", RNS.LOG_ERROR)
-				teardown()
-				sleep_time = 0.1
-
-			sleep(sleep_time)
-
-*/
+			if (OS::time() >= last_inbound + _object->_stale_time) {
+				_object->_status = Type::Link::STALE;
+			}
+		}
+	}
+	else if (_object->_status == Type::Link::STALE) {
+		_object->_status = Type::Link::CLOSED;
+		_object->_teardown_reason = Type::Link::TIMEOUT;
+		link_closed();
+	}
+}
 
 void Link::send_keepalive() {
 	assert(_object);
