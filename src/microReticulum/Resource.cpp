@@ -64,6 +64,20 @@ Resource Resource::accept(const Packet& advertisement_packet, Callbacks::conclud
 		return {Type::NONE};
 	}
 
+	// adv._t (total transfer size) comes straight off the wire with no
+	// upper bound of its own -- matches the reference implementation's
+	// own guard (RNS/Resource.py: "if adv.t > Resource.MAX_EFFICIENT_SIZE*3:
+	// raise ValueError"), which this port was missing entirely. Without
+	// it, a single malformed RESOURCE_ADV with _t near UINT64_MAX drives
+	// _total_parts/_parts/_hashmap sizing below straight into a
+	// multi-gigabyte allocation attempt -- OOM/swap-thrash on a Pi Zero,
+	// or an uncaught std::bad_alloc/std::length_error (accept() has no
+	// surrounding try/catch at its Link::receive() call site).
+	if (adv._t > (size_t)Type::Resource::MAX_EFFICIENT_SIZE * 3) {
+		WARNINGF("Resource advertisement transfer size of %zu bytes exceeds maximum, dropping resource", adv._t);
+		return {Type::NONE};
+	}
+
 	// Allocate a receiver-side Resource via the minimal constructor. The
 	// per-advertisement fields below overwrite the constructor's defaults
 	// directly, so no fluent configuration is needed here.

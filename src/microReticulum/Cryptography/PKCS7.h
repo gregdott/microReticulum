@@ -62,6 +62,17 @@ namespace RNS { namespace Cryptography {
 		static inline void inplace_unpad(Bytes& data, size_t bs = BLOCKSIZE) {
 			size_t len = data.size();
 			//DEBUGF("PKCS7::unpad: len: %lu", len);
+			if (len == 0) {
+				// data.data() returns nullptr for an empty Bytes -- reading
+				// data.data()[data.size()-1] below would be nullptr[SIZE_MAX]
+				// (size_t underflow), a hardware trap rather than a
+				// std::exception, so it isn't caught by any surrounding
+				// try/catch. Reachable from any peer that's completed a
+				// handshake: a minimum-length (48-byte) Token/Fernet
+				// ciphertext strips down to a zero-length AES-CBC output,
+				// which ends up here.
+				throw std::runtime_error("Cannot unpad, buffer is empty");
+			}
 			// read last byte which is pad length
 			//pad = data[-1]
 			size_t padlen = (size_t)data.data()[data.size()-1];

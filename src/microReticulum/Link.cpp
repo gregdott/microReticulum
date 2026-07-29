@@ -925,13 +925,30 @@ void Link::tick_watchdog() {
 
 			if (OS::time() >= last_inbound + _object->_stale_time) {
 				_object->_status = Type::Link::STALE;
+				// Reference implementation's watchdog reschedules its next
+				// check rtt*keepalive_timeout_factor+STALE_GRACE seconds
+				// out upon entering STALE, giving one final keepalive
+				// round-trip a chance to arrive before giving up. This
+				// port's watchdog is ticked on a fixed ~1s interval
+				// instead of a self-scheduled sleep, so without this
+				// deadline STALE would fall straight through to CLOSED on
+				// the very next tick -- under a second later, regardless
+				// of a possibly much longer real RTT (LoRa/multi-hop links
+				// routinely exceed a second) -- causing premature teardown
+				// and avoidable reconnect churn on exactly the slow,
+				// high-latency links this port targets.
+				_object->_stale_grace_deadline = OS::time()
+					+ _object->_rtt * _object->_keepalive_timeout_factor
+					+ Type::Link::STALE_GRACE;
 			}
 		}
 	}
 	else if (_object->_status == Type::Link::STALE) {
-		_object->_status = Type::Link::CLOSED;
-		_object->_teardown_reason = Type::Link::TIMEOUT;
-		link_closed();
+		if (OS::time() >= _object->_stale_grace_deadline) {
+			_object->_status = Type::Link::CLOSED;
+			_object->_teardown_reason = Type::Link::TIMEOUT;
+			link_closed();
+		}
 	}
 }
 

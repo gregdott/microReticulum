@@ -75,6 +75,12 @@ namespace RNS {
 		uint16_t _keepalive_timeout_factor = Type::Link::KEEPALIVE_TIMEOUT_FACTOR;
 		uint16_t _keepalive = Type::Link::KEEPALIVE;
 		uint16_t _stale_time = Type::Link::STALE_TIME;
+		// Set when tick_watchdog() transitions ACTIVE -> STALE; STALE isn't
+		// torn down until this deadline passes, giving a final keepalive
+		// response one more rtt*keepalive_timeout_factor+STALE_GRACE window
+		// to arrive (matches the reference implementation's watchdog
+		// reschedule delay -- see Link::tick_watchdog()'s comment).
+		double _stale_grace_deadline = 0.0;
 		bool _watchdog_lock = false;
 		double _activated_at = 0.0;
 		// CBA LINK

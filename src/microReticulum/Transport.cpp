@@ -41,6 +41,27 @@ using namespace RNS::Type::Transport;
 using namespace RNS::Utilities;
 using namespace RNS::Persistence;
 
+namespace {
+	// Guarantees a bool flag gets reset on every exit from its enclosing
+	// scope -- normal fall-through, an early `return`, *or* an exception
+	// unwinding past it. Transport::inbound() sets _jobs_locked = true at
+	// the top and used to reset it only via an explicit assignment right
+	// before its single fall-through exit; every early `return` in that
+	// ~1250-line function (and any future one) skipped the reset, and
+	// since _jobs_locked also gates Transport::jobs() (link watchdog
+	// ticking, receipt timeouts, announce retransmission, all table
+	// culling), a single truncated/malformed packet -- plausible from
+	// ordinary LoRa packet loss/corruption, no attacker required -- could
+	// silently disable all Transport maintenance for the rest of the
+	// process's uptime. A plain reference (not a Transport member) so it
+	// needs no class access of its own.
+	struct BoolResetGuard {
+		bool& flag;
+		explicit BoolResetGuard(bool& f) : flag(f) {}
+		~BoolResetGuard() { flag = false; }
+	};
+}
+
 #ifndef RNS_PATH_TABLE_MAX
 #define RNS_PATH_TABLE_MAX 100
 #endif
@@ -963,27 +984,20 @@ TRACEF("path_request_conditions=%u", path_request_conditions);
 				_tables_last_culled = OS::time();
 			}
 
-#if RNS_NEIGHBOR_PROBING
-			// DIVERGENCE: passive neighbor-liveness scan — runs every
-			// jobs() tick; per-neighbor rate limits inside the scan
-			// keep probe traffic bounded. Effective only when transport
-			// is enabled, neighbor probing is on, and we ourselves are
-			// reachable as a probe responder so peers can verify us
-			// reciprocally.
-			// CBA TODO Determine if we actually need to gate on probe_destination_enabled() here
-			if (Reticulum::transport_enabled()
-				&& Reticulum::neighbor_probing_enabled()
-				&& Reticulum::probe_destination_enabled())
-			{
-				try {
-					//TRACE("Neighbor probe: Scanning neighbor stats...");
-					_scan_neighbor_stats();
-				}
-				catch (const std::exception& e) {
-					ERRORF("jobs: failed during neighbor stats scan: %s", e.what());
-				}
-			}
-#endif
+			// DIVERGENCE: passive neighbor-liveness scan -- moved to run
+			// *after* _jobs_running is reset to false (see below), not
+			// here. _scan_neighbor_stats() can call _dispatch_neighbor_probe()
+			// -> Packet::send() -> Transport::outbound(), and outbound()'s
+			// very first lines are `while (_jobs_running) sleep(0.0005);` --
+			// with _jobs_running still true from this very jobs() call,
+			// that's a guaranteed self-deadlock on this cooperative port's
+			// single thread (jobs() waiting on a flag only jobs() itself
+			// can clear, via a call nested inside jobs() that can never
+			// return). Confirmed in the field on pinodeHam: main thread
+			// spinning in nanosleep(500us) forever once a neighbor got
+			// flagged suspicious, while the RNode reader thread kept
+			// running fine (a separate thread, unaffected) -- alive,
+			// ~6% CPU, completely unresponsive.
 
             // Check expired blackhole entries
 			if (OS::time() > (_blackhole_last_checked + _blackhole_check_interval)) {
@@ -1056,6 +1070,32 @@ TRACEF("path_request_conditions=%u", path_request_conditions);
 	}
 
 	_jobs_running = false;
+
+#if RNS_NEIGHBOR_PROBING
+	// DIVERGENCE: passive neighbor-liveness scan — runs every jobs() tick;
+	// per-neighbor rate limits inside the scan keep probe traffic bounded.
+	// Effective only when transport is enabled, neighbor probing is on,
+	// and we ourselves are reachable as a probe responder so peers can
+	// verify us reciprocally. Must run after _jobs_running is reset above
+	// (see the comment where this used to live, right before the
+	// blackhole-culling block) since this can synchronously send a
+	// packet, which needs _jobs_running already false to avoid
+	// self-deadlocking against this very jobs() call.
+	// CBA TODO Determine if we actually need to gate on probe_destination_enabled() here
+	if (!_jobs_locked
+		&& Reticulum::transport_enabled()
+		&& Reticulum::neighbor_probing_enabled()
+		&& Reticulum::probe_destination_enabled())
+	{
+		try {
+			//TRACE("Neighbor probe: Scanning neighbor stats...");
+			_scan_neighbor_stats();
+		}
+		catch (const std::exception& e) {
+			ERRORF("jobs: failed during neighbor stats scan: %s", e.what());
+		}
+	}
+#endif
 
 	// CBA send announce retransmission packets
 	for (auto& packet : outgoing) {
@@ -1801,6 +1841,10 @@ TRACEF("path_request_conditions=%u", path_request_conditions);
 	}
 
 	_jobs_locked = true;
+	// See BoolResetGuard's comment: guarantees _jobs_locked = false on
+	// every exit from this function, including the early returns below
+	// and any exception that might unwind past them.
+	BoolResetGuard jobs_lock_guard(_jobs_locked);
 
 	Packet packet(Destination(Type::NONE), raw);
 	if (!packet.unpack()) {
@@ -2307,7 +2351,12 @@ TRACEF("path_timebase=%lu", path_timebase);
 							uint64_t path_announce_emitted = 0;
 							for (const Bytes& path_random_blob : random_blobs) {
 								//p path_announce_emitted = max(path_announce_emitted, int.from_bytes(path_random_blob[5:10], "big"))
-								path_announce_emitted = std::max(path_announce_emitted, OS::from_bytes_big_endian(path_random_blob.data() + 5, 5));
+								// timebase_from_random_blob() (not a raw
+								// inline read) -- it guards size() < 10,
+								// unlike the direct .data()+5 read this
+								// used to do, which OOB-read past a
+								// too-short stored blob.
+								path_announce_emitted = std::max(path_announce_emitted, timebase_from_random_blob(path_random_blob));
 								if (path_announce_emitted >= announce_emitted) {
 									break;
 								}
@@ -3054,7 +3103,8 @@ TRACEF("path_announce_emitted=%lu", path_announce_emitted);
 		}
 	}
 
-	_jobs_locked = false;
+	// _jobs_locked is reset by jobs_lock_guard's destructor above, on
+	// this and every other exit path from this function.
 }
 
 /*static*/ void Transport::synthesize_tunnel(const Interface& interface) {
@@ -4704,7 +4754,16 @@ TRACEF("announce_packet hops: %u", announce_packet.hops());
 	//p random_blob = packet.data[RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8+10]
 	//p announce_emitted = int.from_bytes(random_blob[5:10], "big")
 	Bytes random_blob = packet.data().mid(Type::Identity::KEYSIZE/8+Type::Identity::NAME_HASH_LENGTH/8, 10);
-	if (random_blob) {
+	// Bytes::mid() silently clamps to a shorter-than-requested result
+	// rather than rejecting it, so a truncated announce packet can yield
+	// a non-empty but <10-byte random_blob here -- `if (random_blob)`
+	// alone (non-empty check) let that through, causing an out-of-bounds
+	// heap read 5 bytes further down. Signature validation on the
+	// announce (Identity::validate_announce()) doesn't reject too-short
+	// payloads either, so an attacker using their own valid keypair (no
+	// compromise needed) could sign a deliberately truncated announce
+	// and still reach here.
+	if (random_blob.size() >= 10) {
 		return OS::from_bytes_big_endian(random_blob.data() + 5, 5);
 	}
 	return 0;

@@ -320,6 +320,22 @@ Recall last heard app_data for a destination hash.
 /*static*/ bool Identity::validate_announce(const Packet& packet, bool only_validate_signature /*= false*/) {
 	try {
 		if (packet.packet_type() == Type::Packet::ANNOUNCE) {
+			// Reject outright anything shorter than the smallest valid
+			// announce layout (no ratchet, no app_data) instead of letting
+			// Bytes::mid()/left() below silently clamp a too-short payload
+			// into truncated fields. A signature check alone doesn't catch
+			// this -- an attacker can sign a deliberately truncated
+			// announce with their own valid keypair -- and downstream
+			// consumers of the resulting random_blob (e.g.
+			// Transport::announce_emitted()) have historically assumed a
+			// full-length field was present.
+			constexpr size_t MIN_ANNOUNCE_SIZE = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8;
+			if (packet.data().size() < MIN_ANNOUNCE_SIZE) {
+				DEBUGF("Identity::validate_announce: announce payload of %zu bytes is shorter than minimum %zu, dropping",
+				       packet.data().size(), MIN_ANNOUNCE_SIZE);
+				return false;
+			}
+
 			Bytes destination_hash = packet.destination_hash();
 
             // Get public key bytes from announce
