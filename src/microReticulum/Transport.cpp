@@ -513,6 +513,11 @@ DestinationEntry empty_destination_entry;
 
 	std::vector<Packet> outgoing;
 	std::map<Bytes, Interface> path_requests;	// destination_hash -> blocked_interface ({NONE} = no interface to avoid)
+	// Links whose watchdog decided a keepalive is due this tick. Deferred
+	// (not sent inline from tick_watchdog()) for the same reason `outgoing`
+	// and `path_requests` above are deferred -- see the self-deadlock
+	// comment below, right before _jobs_running is reset to false.
+	std::vector<Link> keepalive_links;
 	int count;
 	_jobs_running = true;
 
@@ -528,7 +533,7 @@ DestinationEntry empty_destination_entry;
 				for (auto& link_const : pending_links) {
 					Link& link = const_cast<Link&>(link_const);
 					if (link.status() != Type::Link::CLOSED) {
-						link.tick_watchdog();
+						link.tick_watchdog(&keepalive_links);
 					}
 				}
 				for (auto& link : pending_links) {
@@ -581,7 +586,7 @@ DestinationEntry empty_destination_entry;
 						// Pump keepalive/stale-timeout watchdog first so a link
 						// that just went STALE/CLOSED is skipped by the resource
 						// pump below rather than ticking resources on a dead link.
-						link.tick_watchdog();
+						link.tick_watchdog(&keepalive_links);
 					}
 					if (link.status() != Type::Link::CLOSED) {
 						link.tick_resources();
@@ -1070,6 +1075,14 @@ TRACEF("path_request_conditions=%u", path_request_conditions);
 	}
 
 	_jobs_running = false;
+
+	// Send any keepalives Link::tick_watchdog() deferred above -- must run
+	// after _jobs_running is reset (see keepalive_links' declaration
+	// comment): Link::send_keepalive() -> Packet::send() ->
+	// Transport::outbound(), which busy-waits on _jobs_running itself.
+	for (auto& link : keepalive_links) {
+		link.send_keepalive();
+	}
 
 #if RNS_NEIGHBOR_PROBING
 	// DIVERGENCE: passive neighbor-liveness scan — runs every jobs() tick;

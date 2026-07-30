@@ -884,7 +884,7 @@ void Link::tick_resources() {
 // cycle for every pending/active link and simply checks whether a deadline
 // has already passed. No sleep/backoff bookkeeping is needed since the
 // caller (Transport::jobs()) already self-throttles via _job_interval.
-void Link::tick_watchdog() {
+void Link::tick_watchdog(std::vector<Link>* keepalive_queue /*= nullptr*/) {
 	assert(_object);
 	if (_object->_status == Type::Link::CLOSED) return;
 	// Mirrors the reference implementation's guard against running the
@@ -920,7 +920,12 @@ void Link::tick_watchdog() {
 
 		if (OS::time() >= last_inbound + _object->_keepalive) {
 			if (_object->_initiator) {
-				send_keepalive();
+				if (keepalive_queue) {
+					keepalive_queue->push_back(*this);
+				}
+				else {
+					send_keepalive();
+				}
 			}
 
 			if (OS::time() >= last_inbound + _object->_stale_time) {

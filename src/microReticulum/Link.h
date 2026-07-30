@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <cassert>
+#include <vector>
 
 namespace RNS {
 
@@ -215,7 +216,15 @@ namespace RNS {
 		// dedicated __watchdog_job() thread: instead of sleeping until the next
 		// deadline, this checks whether a deadline has already passed and acts if
 		// so. Safe to call from Transport::jobs() for every pending/active link.
-		void tick_watchdog();
+		// keepalive_queue: when a keepalive is due, appended here instead of
+		// sent inline. Transport::jobs() calls this itself with
+		// _jobs_running still true, and Link::send_keepalive() -> Packet::
+		// send() -> Transport::outbound() busy-waits on that very flag --
+		// sending inline would self-deadlock the single cooperative thread
+		// (see the neighbor-probe self-deadlock this port already hit and
+		// fixed the same way, in Transport::jobs()). Left nullptr-able for
+		// callers that are not inside a jobs() tick, which can send directly.
+		void tick_watchdog(std::vector<Link>* keepalive_queue = nullptr);
 		// Cooperative pump: iterate this link's incoming/outgoing resources
 		// and tick each Resource::__watchdog_job(). Safe to call from
 		// Transport::jobs() — snapshots both sets before pumping so that a
