@@ -88,7 +88,16 @@ namespace RNS {
 #else
 		using BytesStore = microStore::BasicHeapStore<Utilities::Memory::ContainerAllocator<uint8_t>>;
 #endif
-		using PersistedBytesList = microStore::TypedKeyStore<Bytes, PathStore>;
+		// BUG: was `TypedKeyStore<Bytes, PathStore>` -- PathStore is gated
+		// on RNS_PERSIST_PATHS, but _packet_hashlist wraps _packet_hash_store
+		// (type BytesStore, gated on RNS_PERSIST_HASHLIST). Only compiled
+		// by coincidence when both flags happened to be set the same way
+		// (both stores then resolved to the same underlying microStore
+		// type); fails to compile as soon as the two flags diverge (e.g.
+		// RNS_PERSIST_PATHS=1, RNS_PERSIST_HASHLIST=0), since the
+		// constructor then receives a BytesStore& where a PathStore& is
+		// expected. Use BytesStore, matching what's actually passed in.
+		using PersistedBytesList = microStore::TypedKeyStore<Bytes, BytesStore>;
 
 		class Callbacks {
 		public:

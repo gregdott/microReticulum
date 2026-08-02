@@ -518,6 +518,19 @@ DestinationEntry empty_destination_entry;
 	// and `path_requests` above are deferred -- see the self-deadlock
 	// comment below, right before _jobs_running is reset to false.
 	std::vector<Link> keepalive_links;
+	// Active links whose resource watchdog needs pumping this tick. Deferred
+	// for the exact same self-deadlock reason as keepalive_links above:
+	// Link::tick_resources() -> Resource::__watchdog_job() can synchronously
+	// call Packet::send() -> Transport::outbound() when a resource
+	// advertisement/part retry is due, and outbound()'s very first lines are
+	// `while (_jobs_running) sleep(0.0005);` -- with _jobs_running still true
+	// from this very jobs() call, that's a guaranteed permanent hang on this
+	// cooperative port's single thread (nothing else can ever clear the flag).
+	// Confirmed in the field on wionode: froze solid, alive but completely
+	// unresponsive, right after a "retrying resource advertisement" log line
+	// with no further output -- only reproduces when a resource retry
+	// actually fires, which is why it was intermittent rather than constant.
+	std::vector<Link> resource_tick_links;
 	int count;
 	_jobs_running = true;
 
@@ -573,10 +586,14 @@ DestinationEntry empty_destination_entry;
 					}
 				}
 
-				// Pump each active link's resource watchdogs. Resource
-				// retransmit/timeout retries depend on this — without it,
-				// a dropped resource part stalls the transfer forever
-				// (we never re-request the missing part, server gives up).
+				// Collect each active link's resource watchdog for a deferred
+				// pump after _jobs_running is reset (see resource_tick_links'
+				// declaration comment above for why: tick_resources() can
+				// synchronously send, which self-deadlocks if run nested
+				// inside this very jobs() call). Resource retransmit/timeout
+				// retries depend on this running eventually -- without it, a
+				// dropped resource part stalls the transfer forever (we never
+				// re-request the missing part, server gives up).
 				// const_cast mirrors the pattern used elsewhere when
 				// iterating std::set<Link> — the wrapper is const but
 				// shared_ptr-backed mutation is the codebase convention.
@@ -589,7 +606,7 @@ DestinationEntry empty_destination_entry;
 						link.tick_watchdog(&keepalive_links);
 					}
 					if (link.status() != Type::Link::CLOSED) {
-						link.tick_resources();
+						resource_tick_links.push_back(link);
 					}
 				}
 
@@ -1082,6 +1099,15 @@ TRACEF("path_request_conditions=%u", path_request_conditions);
 	// Transport::outbound(), which busy-waits on _jobs_running itself.
 	for (auto& link : keepalive_links) {
 		link.send_keepalive();
+	}
+
+	// Deferred from the active-links loop above -- see resource_tick_links'
+	// declaration comment for why this can't run while _jobs_running is
+	// still true.
+	for (auto& link : resource_tick_links) {
+		if (link.status() != Type::Link::CLOSED) {
+			link.tick_resources();
+		}
 	}
 
 #if RNS_NEIGHBOR_PROBING
@@ -4382,7 +4408,9 @@ static void remote_path_pack_rate_entry(MsgPack::Packer& p,
 }
 
 /*static*/ void Transport::probe_request_handler(const Bytes& data, const Packet& packet) {
+#if RNS_NEIGHBOR_PROBING
 	++_probes_received;
+#endif
 	TRACE("Transport::probe_request_handler");
 }
 
